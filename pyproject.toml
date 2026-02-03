@@ -1,0 +1,20 @@
+[project]
+name = "krader"
+version = "0.1.0"
+description = "Automated trading system for Kiwoom Open API+"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pywin32>=306",
+    "PyQt5>=5.15",
+    "aiosqlite>=0.19",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+krader = "krader.main:main"
+
+[tool.setuptools.packages.find]
+include = ["krader*"]
