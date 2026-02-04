@@ -5,6 +5,8 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from krader.config import RiskConfig
 from krader.risk.portfolio import Portfolio
 from krader.risk.validator import RiskValidator
@@ -49,6 +51,7 @@ def create_context(daily_trades: int = 0) -> StrategyContext:
     )
 
 
+@pytest.mark.asyncio
 async def test_max_trades_per_day_reject():
     """Test that signals are rejected when max trades reached."""
     print("\n" + "=" * 60)
@@ -82,6 +85,7 @@ async def test_max_trades_per_day_reject():
     print("✅ PASS: Signal rejected when max trades reached")
 
 
+@pytest.mark.asyncio
 async def test_max_trades_per_day_accept():
     """Test that signals are accepted when under max trades."""
     print("\n" + "=" * 60)
@@ -113,6 +117,7 @@ async def test_max_trades_per_day_accept():
     print("✅ PASS: Signal accepted when under max trades")
 
 
+@pytest.mark.asyncio
 async def test_transaction_cost_cash_check():
     """Test that transaction cost is included in cash check."""
     print("\n" + "=" * 60)
@@ -159,6 +164,7 @@ async def test_transaction_cost_cash_check():
     print(f"✅ PASS: Quantity reduced from {quantity} to {result.approved_quantity} due to fees")
 
 
+@pytest.mark.asyncio
 async def test_transaction_cost_estimation():
     """Test transaction cost estimation calculation."""
     print("\n" + "=" * 60)
@@ -190,6 +196,7 @@ async def test_transaction_cost_estimation():
     print("✅ PASS: Transaction cost calculated correctly")
 
 
+@pytest.mark.asyncio
 async def test_backward_compatibility():
     """Test that validate_signal works without context (backward compat)."""
     print("\n" + "=" * 60)
@@ -216,6 +223,7 @@ async def test_backward_compatibility():
     print("✅ PASS: validate_signal works without context (backward compatible)")
 
 
+@pytest.mark.asyncio
 async def test_position_size_calculation():
     """Test automatic position sizing when quantity is None."""
     print("\n" + "=" * 60)
@@ -271,6 +279,7 @@ async def test_position_size_calculation():
     print(f"✅ PASS: Position size correctly calculated as {expected_qty} shares (5% of 10M @ 50K)")
 
 
+@pytest.mark.asyncio
 async def test_position_size_respects_max():
     """Test that calculated position size respects max_position_size."""
     print("\n" + "=" * 60)

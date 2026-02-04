@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from krader.strategy import PullbackV1
 from krader.strategy.base import MarketSnapshot, StrategyContext
 from krader.risk.portfolio import Portfolio
@@ -133,6 +135,7 @@ def create_rsi_crossover_ltf_candles(symbol: str, base_price: float) -> list[dic
     return candles
 
 
+@pytest.mark.asyncio
 async def test_buy_signal():
     """Test to generate a BUY signal."""
     print("=" * 70)
