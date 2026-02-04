@@ -62,3 +62,13 @@ class ControlEvent(Event):
     """System control event."""
 
     command: Literal["pause", "resume", "shutdown", "kill"] = "pause"
+
+
+@dataclass(frozen=True)
+class ErrorEvent(Event):
+    """Error notification event."""
+
+    error_type: str = ""  # Category: "broker_connection", "tick_validation", etc.
+    message: str = ""
+    severity: Literal["warning", "error", "critical"] = "error"
+    context: dict[str, Any] = field(default_factory=dict)

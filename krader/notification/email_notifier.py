@@ -2,18 +2,21 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import aiosmtplib
 
 if TYPE_CHECKING:
     from krader.config import EmailConfig
-    from krader.events import ControlEvent, FillEvent, OrderEvent
+    from krader.events import ControlEvent, ErrorEvent, FillEvent, OrderEvent
 
 logger = logging.getLogger(__name__)
+
+ErrorSeverity = Literal["warning", "error", "critical"]
 
 
 @dataclass
@@ -24,6 +27,17 @@ class EmailMessage:
     subject: str
     body: str
     created_at: datetime
+
+
+@dataclass
+class ErrorTracker:
+    """Track error occurrences for aggregation."""
+
+    error_type: str
+    first_seen: datetime
+    last_seen: datetime
+    count: int = 1
+    samples: list[str] = field(default_factory=list)
 
 
 class EmailNotifier:
@@ -43,6 +57,13 @@ class EmailNotifier:
     DEDUP_TTL_SECONDS = 300  # 5 minutes
     BACKOFF_BASE_SECONDS = 1.0
 
+    # Error aggregation settings
+    ERROR_THRESHOLD_WARNING = 3  # Send email after N occurrences
+    ERROR_THRESHOLD_ERROR = 2
+    ERROR_THRESHOLD_CRITICAL = 1  # Immediate notification
+    ERROR_WINDOW_SECONDS = 300  # 5 minute window for aggregation
+    MAX_ERROR_SAMPLES = 5  # Max error samples to include in email
+
     def __init__(self, config: "EmailConfig") -> None:
         self._config = config
         self._queue: asyncio.Queue[EmailMessage] = asyncio.Queue(maxsize=self.MAX_QUEUE_SIZE)
@@ -54,6 +75,9 @@ class EmailNotifier:
 
         # Rate limiting: timestamps of recent sends
         self._send_timestamps: list[datetime] = []
+
+        # Error tracking: error_type -> ErrorTracker
+        self._error_trackers: dict[str, ErrorTracker] = {}
 
     async def start(self) -> None:
         """Start the background worker."""
@@ -166,6 +190,113 @@ Time: {event.timestamp.isoformat()}
 
         await self._enqueue(
             event_id=f"control_{event.command}_{event.timestamp.isoformat()}",
+            subject=subject,
+            body=body,
+        )
+
+    async def on_error_event(self, event: "ErrorEvent") -> None:
+        """Handle ErrorEvent from event bus."""
+        await self.on_error(
+            error_type=event.error_type,
+            message=event.message,
+            severity=event.severity,
+            context=event.context if event.context else None,
+        )
+
+    async def on_error(
+        self,
+        error_type: str,
+        message: str,
+        severity: ErrorSeverity = "error",
+        context: dict | None = None,
+    ) -> None:
+        """
+        Handle error events with aggregation.
+
+        Args:
+            error_type: Category of error (e.g., "broker_connection", "tick_validation")
+            message: Error message/details
+            severity: "warning", "error", or "critical"
+            context: Optional additional context
+        """
+        now = datetime.now()
+        threshold = {
+            "warning": self.ERROR_THRESHOLD_WARNING,
+            "error": self.ERROR_THRESHOLD_ERROR,
+            "critical": self.ERROR_THRESHOLD_CRITICAL,
+        }.get(severity, self.ERROR_THRESHOLD_ERROR)
+
+        # Clean up old error trackers
+        self._cleanup_error_trackers(now)
+
+        # Get or create tracker for this error type
+        if error_type in self._error_trackers:
+            tracker = self._error_trackers[error_type]
+            tracker.count += 1
+            tracker.last_seen = now
+            if len(tracker.samples) < self.MAX_ERROR_SAMPLES:
+                tracker.samples.append(message)
+        else:
+            tracker = ErrorTracker(
+                error_type=error_type,
+                first_seen=now,
+                last_seen=now,
+                count=1,
+                samples=[message],
+            )
+            self._error_trackers[error_type] = tracker
+
+        # Check if threshold reached
+        if tracker.count >= threshold:
+            await self._send_error_notification(tracker, severity, context)
+            # Reset tracker after sending
+            del self._error_trackers[error_type]
+
+    def _cleanup_error_trackers(self, now: datetime) -> None:
+        """Remove expired error trackers."""
+        cutoff = now - timedelta(seconds=self.ERROR_WINDOW_SECONDS)
+        expired = [k for k, v in self._error_trackers.items() if v.last_seen < cutoff]
+        for key in expired:
+            del self._error_trackers[key]
+
+    async def _send_error_notification(
+        self,
+        tracker: ErrorTracker,
+        severity: ErrorSeverity,
+        context: dict | None,
+    ) -> None:
+        """Send aggregated error notification."""
+        env_prefix = f"[{self._config.environment.upper()}] "
+        severity_label = severity.upper()
+
+        if severity == "critical":
+            subject = f"{env_prefix}CRITICAL: Krader Error - {tracker.error_type}"
+        elif severity == "error":
+            subject = f"{env_prefix}ERROR: Krader - {tracker.error_type} ({tracker.count}x)"
+        else:
+            subject = f"{env_prefix}WARNING: Krader - {tracker.error_type} ({tracker.count}x)"
+
+        samples_text = "\n".join(f"  - {s}" for s in tracker.samples)
+        context_text = ""
+        if context:
+            context_text = "\nContext:\n" + "\n".join(f"  {k}: {v}" for k, v in context.items())
+
+        body = f"""{severity_label}: {tracker.error_type}
+
+Occurrences: {tracker.count}
+First seen: {tracker.first_seen.isoformat()}
+Last seen: {tracker.last_seen.isoformat()}
+Duration: {(tracker.last_seen - tracker.first_seen).total_seconds():.1f}s
+
+Error samples:
+{samples_text}
+{context_text}
+
+Please investigate.
+"""
+
+        await self._enqueue(
+            event_id=f"error_{tracker.error_type}_{tracker.first_seen.isoformat()}",
             subject=subject,
             body=body,
         )

@@ -32,9 +32,28 @@ class Balance:
 
 
 TickCallback = Callable[["Tick"], Coroutine[Any, Any, None]]
+ErrorCallback = Callable[[str, str, str, dict], Coroutine[Any, Any, None]]  # error_type, message, severity, context
 
 
 class BaseBroker(ABC):
+    """Abstract broker interface for trading operations."""
+
+    _error_callback: ErrorCallback | None = None
+
+    def set_error_callback(self, callback: ErrorCallback) -> None:
+        """Set callback for error reporting."""
+        self._error_callback = callback
+
+    async def _report_error(
+        self,
+        error_type: str,
+        message: str,
+        severity: str = "error",
+        context: dict | None = None,
+    ) -> None:
+        """Report an error through callback if set."""
+        if self._error_callback:
+            await self._error_callback(error_type, message, severity, context or {})
     """Abstract broker interface for trading operations."""
 
     @abstractmethod

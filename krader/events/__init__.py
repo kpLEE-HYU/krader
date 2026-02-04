@@ -3,6 +3,7 @@
 from krader.events.bus import EventBus
 from krader.events.types import (
     ControlEvent,
+    ErrorEvent,
     Event,
     FillEvent,
     MarketEvent,
@@ -17,5 +18,6 @@ __all__ = [
     "OrderEvent",
     "FillEvent",
     "ControlEvent",
+    "ErrorEvent",
     "EventBus",
 ]

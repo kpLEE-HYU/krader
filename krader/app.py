@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from krader.broker.base import BaseBroker
 from krader.broker.kiwoom import KiwoomBroker
 from krader.config import Settings
-from krader.events import ControlEvent, EventBus, FillEvent, MarketEvent, OrderEvent, SignalEvent
+from krader.events import ControlEvent, ErrorEvent, EventBus, FillEvent, MarketEvent, OrderEvent, SignalEvent
 from krader.notification import EmailNotifier
 from krader.execution.oms import OrderManagementSystem
 from krader.market.service import MarketDataService
@@ -156,6 +156,7 @@ class Application:
             self._event_bus.subscribe(OrderEvent, self._email_notifier.on_order_event)
             self._event_bus.subscribe(FillEvent, self._email_notifier.on_fill_event)
             self._event_bus.subscribe(ControlEvent, self._email_notifier.on_control_event)
+            self._event_bus.subscribe(ErrorEvent, self._email_notifier.on_error_event)
             logger.info("Email notifications enabled")
 
         if self._settings.broker.type == "mock":
@@ -165,6 +166,10 @@ class Application:
                 account_number=self._settings.broker.account_number,
                 tr_rate_limit_ms=self._settings.broker.tr_rate_limit_ms,
             )
+
+        # Wire up broker error reporting to event bus
+        self._broker.set_error_callback(self._on_broker_error)
+
         await self._broker.connect()
 
         self._risk_validator = RiskValidator(self._settings.risk)
@@ -317,6 +322,24 @@ class Application:
         if self._control:
             await self._control.request_shutdown("OS signal received")
 
+    async def _on_broker_error(
+        self,
+        error_type: str,
+        message: str,
+        severity: str,
+        context: dict,
+    ) -> None:
+        """Handle errors reported by broker - emit as ErrorEvent."""
+        if self._event_bus:
+            await self._event_bus.publish(
+                ErrorEvent(
+                    error_type=error_type,
+                    message=message,
+                    severity=severity,
+                    context=context,
+                )
+            )
+
     async def _universe_refresh_loop(self) -> None:
         """Background task to periodically refresh universe."""
         while self._running:
@@ -345,6 +368,14 @@ class Application:
 
             if not new_universe:
                 logger.warning("Universe refresh returned empty, keeping old universe")
+                if self._event_bus:
+                    await self._event_bus.publish(
+                        ErrorEvent(
+                            error_type="universe_refresh",
+                            message="Universe refresh returned empty, keeping old universe",
+                            severity="warning",
+                        )
+                    )
                 return
 
             old_set = set(self._universe)
