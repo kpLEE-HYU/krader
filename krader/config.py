@@ -66,6 +66,22 @@ class LoggingConfig(BaseModel):
     json_format: bool = Field(default=True)
 
 
+class EmailConfig(BaseModel):
+    """Email notification configuration."""
+
+    enabled: bool = Field(default=False)
+    smtp_host: str = Field(default="smtp.gmail.com")
+    smtp_port: int = Field(default=587)
+    smtp_user: str = Field(default="")
+    smtp_password: str = Field(default="")
+    use_tls: bool = Field(default=True)
+    from_address: str = Field(default="")
+    to_addresses: list[str] = Field(default_factory=list)
+    environment: Literal["dev", "staging", "prod"] = Field(default="dev")
+    send_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    max_retries: int = Field(default=3, ge=0, le=10)
+
+
 class Settings(BaseSettings):
     """Application settings."""
 
@@ -74,6 +90,7 @@ class Settings(BaseSettings):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    email: EmailConfig = Field(default_factory=EmailConfig)
 
     # Strategy selection - must match a registered strategy name
     strategy: str = Field(

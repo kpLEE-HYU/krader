@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 from krader.broker.base import BaseBroker
 from krader.broker.kiwoom import KiwoomBroker
 from krader.config import Settings
-from krader.events import EventBus, FillEvent, MarketEvent, SignalEvent
+from krader.events import ControlEvent, EventBus, FillEvent, MarketEvent, OrderEvent, SignalEvent
+from krader.notification import EmailNotifier
 from krader.execution.oms import OrderManagementSystem
 from krader.market.service import MarketDataService
 from krader.monitor.control import ControlManager
@@ -100,6 +101,7 @@ class Application:
         self._universe: list[str] = []
         self._universe_refresh_task: asyncio.Task | None = None
         self._universe_refresh_interval_minutes: int = 30
+        self._email_notifier: EmailNotifier | None = None
 
         self._strategies: list[BaseStrategy] = []
         self._daily_trades_count: int = 0
@@ -147,6 +149,14 @@ class Application:
 
         self._event_bus = EventBus()
         await self._event_bus.start()
+
+        if self._settings.email.enabled:
+            self._email_notifier = EmailNotifier(self._settings.email)
+            await self._email_notifier.start()
+            self._event_bus.subscribe(OrderEvent, self._email_notifier.on_order_event)
+            self._event_bus.subscribe(FillEvent, self._email_notifier.on_fill_event)
+            self._event_bus.subscribe(ControlEvent, self._email_notifier.on_control_event)
+            logger.info("Email notifications enabled")
 
         if self._settings.broker.type == "mock":
             self._broker = MockBroker()
@@ -266,6 +276,9 @@ class Application:
 
         if self._market_service:
             await self._market_service.shutdown()
+
+        if self._email_notifier:
+            await self._email_notifier.stop()
 
         if self._event_bus:
             await self._event_bus.stop()
