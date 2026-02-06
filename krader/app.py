@@ -3,12 +3,15 @@
 import asyncio
 import logging
 import signal
+import time
+from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from krader.broker.base import BaseBroker
 from krader.broker.kiwoom import KiwoomBroker
 from krader.config import Settings
+from krader.journal.service import JournalService
 from krader.events import ControlEvent, ErrorEvent, EventBus, FillEvent, MarketEvent, OrderEvent, SignalEvent
 from krader.notification import EmailNotifier
 from krader.execution.oms import OrderManagementSystem
@@ -102,9 +105,14 @@ class Application:
         self._universe_refresh_task: asyncio.Task | None = None
         self._universe_refresh_interval_minutes: int = 30
         self._email_notifier: EmailNotifier | None = None
+        self._journal_service: JournalService | None = None
+        self._was_market_open: bool = False
 
         self._strategies: list[BaseStrategy] = []
         self._daily_trades_count: int = 0
+        self._tick_count: int = 0
+        self._signal_count: int = 0
+        self._last_status_time: float = 0
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
         """Add a strategy to the application."""
@@ -243,10 +251,105 @@ class Application:
         if self._universe_service:
             self._universe_refresh_task = asyncio.create_task(self._universe_refresh_loop())
 
+        if self._settings.journal.enabled:
+            self._journal_service = JournalService(
+                repo=self._repo,
+                journal_dir=self._settings.journal.journal_dir,
+                strategy_name=self._settings.strategy,
+            )
+            logger.info("Journal service enabled (dir=%s)", self._settings.journal.journal_dir)
+
         self._setup_signal_handlers()
 
         self._running = True
         logger.info("Krader started successfully (run_id=%s)", self._reconciler.run_id)
+
+    def _get_market_status(self) -> str:
+        """Get current market status string."""
+        now = datetime.now()
+        risk = self._settings.risk
+        market_open = now.replace(
+            hour=risk.trading_start_hour, minute=risk.trading_start_minute,
+            second=0, microsecond=0,
+        )
+        market_close = now.replace(
+            hour=risk.trading_end_hour, minute=risk.trading_end_minute,
+            second=0, microsecond=0,
+        )
+
+        if market_open <= now <= market_close:
+            remaining = market_close - now
+            mins = int(remaining.total_seconds()) // 60
+            return f"장중 (마감까지 {mins // 60}시간 {mins % 60}분)"
+        elif now < market_open:
+            remaining = market_open - now
+            mins = int(remaining.total_seconds()) // 60
+            return f"장 시작 대기 ({mins // 60}시간 {mins % 60}분 후)"
+        else:
+            return "장 마감"
+
+    def _is_market_open(self) -> bool:
+        """Check if the market is currently open."""
+        now = datetime.now()
+        risk = self._settings.risk
+        market_open = now.replace(
+            hour=risk.trading_start_hour, minute=risk.trading_start_minute,
+            second=0, microsecond=0,
+        )
+        market_close = now.replace(
+            hour=risk.trading_end_hour, minute=risk.trading_end_minute,
+            second=0, microsecond=0,
+        )
+        return market_open <= now <= market_close
+
+    async def _on_market_close(self) -> None:
+        """Triggered when market transitions from open to closed."""
+        logger.info("Market close detected, generating daily journal...")
+        await self._generate_journal()
+
+    async def _generate_journal(self) -> None:
+        """Generate daily journal if service is enabled and not yet generated."""
+        if not self._journal_service or self._journal_service.generated_today:
+            return
+        try:
+            portfolio = self._portfolio_tracker.portfolio
+            path = await self._journal_service.generate_journal(
+                date=datetime.now(),
+                portfolio_equity=portfolio.total_equity,
+                portfolio_cash=portfolio.cash,
+            )
+            if path:
+                logger.info("Daily journal saved: %s", path)
+        except Exception as e:
+            logger.error("Failed to generate journal: %s", e)
+
+    def _log_status(self) -> None:
+        """Log periodic status update."""
+        now = time.time()
+        if now - self._last_status_time < 30:
+            return
+        self._last_status_time = now
+
+        portfolio = self._portfolio_tracker.portfolio
+        positions = len(portfolio.positions)
+        market_status = self._get_market_status()
+        kill = " [KILL SWITCH]" if self._control.is_kill_switch_active else ""
+        paused = " [PAUSED]" if self._control.is_paused else ""
+
+        logger.info(
+            "STATUS | %s%s%s | ticks=%d | signals=%d | trades=%d/%d | "
+            "positions=%d | cash=%s | universe=%d",
+            market_status,
+            kill,
+            paused,
+            self._tick_count,
+            self._signal_count,
+            self._daily_trades_count,
+            self._settings.risk.max_trades_per_day,
+            positions,
+            f"{portfolio.cash:,.0f}",
+            len(self._universe),
+        )
 
     async def run(self) -> None:
         """Run the main application loop."""
@@ -255,6 +358,13 @@ class Application:
 
             while self._running and not self._control.shutdown_requested:
                 await asyncio.sleep(0.1)
+                self._log_status()
+
+                # Detect market close transition
+                is_open = self._is_market_open()
+                if self._was_market_open and not is_open:
+                    await self._on_market_close()
+                self._was_market_open = is_open
 
                 if self._control.is_kill_switch_active:
                     await asyncio.sleep(1)
@@ -287,6 +397,9 @@ class Application:
 
         if self._event_bus:
             await self._event_bus.stop()
+
+        # Generate journal before closing DB (if not already generated)
+        await self._generate_journal()
 
         if self._reconciler:
             status = "KILLED" if self._control and self._control.is_kill_switch_active else "COMPLETED"
@@ -407,6 +520,10 @@ class Application:
 
     async def _on_market_event(self, event: MarketEvent) -> None:
         """Handle market data events."""
+        if event.event_type == "tick":
+            self._tick_count += 1
+            return
+
         if self._control and self._control.is_paused:
             return
 
@@ -459,6 +576,8 @@ class Application:
 
     async def _on_signal_event(self, event: SignalEvent) -> None:
         """Handle signal events."""
+        self._signal_count += 1
+
         if self._control and self._control.is_paused:
             return
 

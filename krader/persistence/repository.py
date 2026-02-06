@@ -218,6 +218,46 @@ class Repository:
         )
         return row["count"] if row else 0
 
+    async def get_orders_for_date(self, start_ts: int, end_ts: int) -> list[dict]:
+        """Get all orders created within a timestamp range."""
+        rows = await self._db.fetchall(
+            """
+            SELECT * FROM orders
+            WHERE created_at >= ? AND created_at < ?
+            ORDER BY created_at ASC
+            """,
+            (start_ts, end_ts),
+        )
+        return [dict(row) for row in rows]
+
+    async def get_candles_after(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 6,
+        after: datetime | None = None,
+    ) -> list[dict]:
+        """Get candles after a given time (ascending order)."""
+        if after:
+            rows = await self._db.fetchall(
+                """
+                SELECT * FROM candles
+                WHERE symbol = ? AND timeframe = ? AND open_time > ?
+                ORDER BY open_time ASC LIMIT ?
+                """,
+                (symbol, timeframe, int(after.timestamp()), limit),
+            )
+        else:
+            rows = await self._db.fetchall(
+                """
+                SELECT * FROM candles
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY open_time ASC LIMIT ?
+                """,
+                (symbol, timeframe, limit),
+            )
+        return [dict(row) for row in rows]
+
     # --- Fill operations ---
 
     async def save_fill(

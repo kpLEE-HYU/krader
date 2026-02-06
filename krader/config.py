@@ -66,6 +66,13 @@ class LoggingConfig(BaseModel):
     json_format: bool = Field(default=True)
 
 
+class JournalConfig(BaseModel):
+    """Journal generation configuration."""
+
+    enabled: bool = Field(default=True)
+    journal_dir: Path = Field(default=Path("journals"))
+
+
 class EmailConfig(BaseModel):
     """Email notification configuration."""
 
@@ -91,6 +98,7 @@ class Settings(BaseSettings):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
+    journal: JournalConfig = Field(default_factory=JournalConfig)
 
     # Strategy selection - must match a registered strategy name
     strategy: str = Field(
