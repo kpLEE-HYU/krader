@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import queue
 import sys
 import threading
 import time
@@ -86,6 +87,9 @@ class KiwoomBroker(BaseBroker):
         self._timer: Any = None
         self._running = False
 
+        # Thread-safe queue for dispatching OCX calls to the Qt thread
+        self._qt_call_queue: queue.Queue = queue.Queue()
+
     @property
     def is_connected(self) -> bool:
         """Check if connected to Kiwoom."""
@@ -127,12 +131,16 @@ class KiwoomBroker(BaseBroker):
             raise ConnectionError("Login failed")
 
         # Detect paper trading mode (모의투자)
-        server_gubun = self._call_api("GetLoginInfo", "GetServerGubun")
+        server_gubun = await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall("GetLoginInfo(QString)", "GetServerGubun")
+        )
         self._is_paper = server_gubun == "1"
 
         # Get account number if not provided
         if not self._account_number:
-            accounts = self._call_api("GetLoginInfo", "ACCNO")
+            accounts = await self._invoke_in_qt(
+                lambda: self._ocx.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+            )
             if accounts:
                 self._account_number = accounts.split(";")[0]
 
@@ -171,6 +179,11 @@ class KiwoomBroker(BaseBroker):
             logger.info("Login popup opened, waiting for user...")
             ready_event.set()
 
+            # Process cross-thread OCX calls via timer
+            self._qt_timer = QTimer()
+            self._qt_timer.timeout.connect(self._process_qt_queue)
+            self._qt_timer.start(10)
+
             # Run Qt event loop
             self._app.exec_()
 
@@ -179,18 +192,43 @@ class KiwoomBroker(BaseBroker):
             ready_event.set()
             logger.error("Qt thread error: %s", e)
 
-    def _call_api(self, method: str, *args) -> Any:
-        """Call Kiwoom API method (must be called from Qt thread or use dynamicCall)."""
+    def _process_qt_queue(self) -> None:
+        """Process pending OCX calls from other threads (runs in Qt thread)."""
+        try:
+            while True:
+                callback = self._qt_call_queue.get_nowait()
+                callback()
+        except queue.Empty:
+            pass
+
+    async def _invoke_in_qt(self, func: Callable) -> Any:
+        """Execute a function in the Qt thread and await the result."""
+        if not self._event_loop:
+            raise ConnectionError("Event loop not available")
+
+        future = self._event_loop.create_future()
+
+        def _execute():
+            try:
+                result = func()
+                self._event_loop.call_soon_threadsafe(future.set_result, result)
+            except Exception as e:
+                self._event_loop.call_soon_threadsafe(future.set_exception, e)
+
+        self._qt_call_queue.put(_execute)
+        return await future
+
+    async def _call_api(self, method: str, *args) -> Any:
+        """Call Kiwoom API method via Qt thread."""
         if not self._ocx:
             raise ConnectionError("Not connected")
 
-        # Build the method signature
         if args:
             arg_types = ", ".join(["QString"] * len(args))
             signature = f"{method}({arg_types})"
-            return self._ocx.dynamicCall(signature, *args)
+            return await self._invoke_in_qt(lambda: self._ocx.dynamicCall(signature, *args))
         else:
-            return self._ocx.dynamicCall(f"{method}()")
+            return await self._invoke_in_qt(lambda: self._ocx.dynamicCall(f"{method}()"))
 
     def _on_event_connect(self, err_code: int) -> None:
         """Handle login callback."""
@@ -322,15 +360,16 @@ class KiwoomBroker(BaseBroker):
         await self._rate_limit()
         self._tr_event = asyncio.Event()
 
-        # Set input values - dynamicCall is thread-safe for COM/OCX
-        for key, value in inputs.items():
-            self._ocx.dynamicCall("SetInputValue(QString, QString)", key, value)
+        # SetInputValue + CommRqData must run together in Qt thread
+        def _send():
+            for key, value in inputs.items():
+                self._ocx.dynamicCall("SetInputValue(QString, QString)", key, value)
+            return self._ocx.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                rq_name, tr_code, 0, screen_no
+            )
 
-        # Send the request
-        result = self._ocx.dynamicCall(
-            "CommRqData(QString, QString, int, QString)",
-            rq_name, tr_code, 0, screen_no
-        )
+        result = await self._invoke_in_qt(_send)
 
         if result != 0:
             raise RateLimitError(
@@ -345,6 +384,39 @@ class KiwoomBroker(BaseBroker):
             raise ConnectionError("TR request timeout")
 
         return self._tr_data.get(rq_name, {})
+
+    async def request_tr(
+        self,
+        tr_code: str,
+        rq_name: str,
+        inputs: dict[str, str],
+        screen_no: str = "0101",
+    ) -> dict:
+        """Public API: Send a TR request and wait for response."""
+        return await self._request_tr(tr_code, rq_name, inputs, screen_no)
+
+    async def get_comm_data(
+        self, tr_code: str, rq_name: str, index: int, field: str
+    ) -> str:
+        """Get a single field from the most recent TR response."""
+        if not self._ocx:
+            return ""
+        return await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                tr_code, rq_name, index, field,
+            )
+        )
+
+    async def get_repeat_cnt(self, tr_code: str, rq_name: str) -> int:
+        """Get repeat count from the most recent TR response."""
+        if not self._ocx:
+            return 0
+        return await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall(
+                "GetRepeatCnt(QString, QString)", tr_code, rq_name
+            )
+        )
 
     async def place_order(self, order: "Order") -> str:
         """Place an order with Kiwoom."""
@@ -361,17 +433,19 @@ class KiwoomBroker(BaseBroker):
         hoga_type = "00" if order.order_type == "LIMIT" else "03"
         price = int(order.price) if order.price else 0
 
-        result = self._ocx.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "주문",  # rq_name
-            "0101",  # screen_no
-            self._account_number,
-            order_type,
-            order.symbol,
-            order.quantity,
-            price,
-            hoga_type,
-            "",  # original order no
+        result = await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall(
+                "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                "주문",
+                "0101",
+                self._account_number,
+                order_type,
+                order.symbol,
+                order.quantity,
+                price,
+                hoga_type,
+                "",
+            )
         )
 
         if result != 0:
@@ -386,17 +460,19 @@ class KiwoomBroker(BaseBroker):
         """Cancel an order."""
         await self._rate_limit()
 
-        result = self._ocx.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "취소",
-            "0102",
-            self._account_number,
-            3,  # Cancel type
-            "",
-            0,
-            0,
-            "00",
-            broker_order_id,
+        result = await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall(
+                "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                "취소",
+                "0102",
+                self._account_number,
+                3,
+                "",
+                0,
+                0,
+                "00",
+                broker_order_id,
+            )
         )
         return result == 0
 
@@ -406,17 +482,19 @@ class KiwoomBroker(BaseBroker):
         """Amend an existing order."""
         await self._rate_limit()
 
-        result = self._ocx.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "정정",
-            "0102",
-            self._account_number,
-            5 if quantity else 6,
-            "",
-            quantity or 0,
-            int(price) if price else 0,
-            "00",
-            broker_order_id,
+        result = await self._invoke_in_qt(
+            lambda: self._ocx.dynamicCall(
+                "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+                "정정",
+                "0102",
+                self._account_number,
+                5 if quantity else 6,
+                "",
+                quantity or 0,
+                int(price) if price else 0,
+                "00",
+                broker_order_id,
+            )
         )
         return result == 0
 
@@ -434,39 +512,47 @@ class KiwoomBroker(BaseBroker):
             },
         )
 
-        positions = []
         tr_code = data.get("tr_code", "opw00018")
-        row_count = self._ocx.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, "계좌평가결과")
 
-        for i in range(row_count):
-            symbol = self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)", tr_code, "계좌평가결과", i, "종목번호"
-            ).strip()
-            qty = int(self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)", tr_code, "계좌평가결과", i, "보유수량"
-            ) or 0)
-            avg_price = int(self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)", tr_code, "계좌평가결과", i, "매입가"
-            ) or 0)
-            cur_price = int(self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)", tr_code, "계좌평가결과", i, "현재가"
-            ) or 0)
-            pnl = int(self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)", tr_code, "계좌평가결과", i, "평가손익"
-            ) or 0)
-
-            if symbol and qty > 0:
-                positions.append(
-                    Position(
-                        symbol=symbol.replace("A", ""),
-                        quantity=qty,
-                        avg_price=Decimal(avg_price),
-                        current_price=Decimal(cur_price),
-                        unrealized_pnl=Decimal(pnl),
+        def _read_positions():
+            positions = []
+            row_count = self._ocx.dynamicCall(
+                "GetRepeatCnt(QString, QString)", tr_code, "계좌평가결과"
+            )
+            for i in range(row_count):
+                symbol = self._ocx.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, "계좌평가결과", i, "종목번호",
+                ).strip()
+                qty = int(self._ocx.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, "계좌평가결과", i, "보유수량",
+                ) or 0)
+                avg_price = int(self._ocx.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, "계좌평가결과", i, "매입가",
+                ) or 0)
+                cur_price = int(self._ocx.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, "계좌평가결과", i, "현재가",
+                ) or 0)
+                pnl = int(self._ocx.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    tr_code, "계좌평가결과", i, "평가손익",
+                ) or 0)
+                if symbol and qty > 0:
+                    positions.append(
+                        Position(
+                            symbol=symbol.replace("A", ""),
+                            quantity=qty,
+                            avg_price=Decimal(avg_price),
+                            current_price=Decimal(cur_price),
+                            unrealized_pnl=Decimal(pnl),
+                        )
                     )
-                )
+            return positions
 
-        return positions
+        return await self._invoke_in_qt(_read_positions)
 
     async def fetch_open_orders(self) -> list[dict]:
         """Fetch open orders from Kiwoom."""
@@ -483,34 +569,43 @@ class KiwoomBroker(BaseBroker):
             },
         )
 
-        orders = []
-        row_count = self._ocx.dynamicCall("GetRepeatCnt(QString, QString)", "opt10075", "미체결")
+        def _read_orders():
+            orders = []
+            row_count = self._ocx.dynamicCall(
+                "GetRepeatCnt(QString, QString)", "opt10075", "미체결"
+            )
+            for i in range(row_count):
+                order_data = {
+                    "broker_order_id": self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "주문번호",
+                    ).strip(),
+                    "symbol": self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "종목코드",
+                    ).strip(),
+                    "side": "BUY" if self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "매매구분",
+                    ).strip() == "2" else "SELL",
+                    "quantity": int(self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "주문수량",
+                    ) or 0),
+                    "filled_quantity": int(self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "체결량",
+                    ) or 0),
+                    "price": int(self._ocx.dynamicCall(
+                        "GetCommData(QString, QString, int, QString)",
+                        "opt10075", "미체결", i, "주문가격",
+                    ) or 0),
+                }
+                if order_data["broker_order_id"]:
+                    orders.append(order_data)
+            return orders
 
-        for i in range(row_count):
-            order_data = {
-                "broker_order_id": self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "주문번호"
-                ).strip(),
-                "symbol": self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "종목코드"
-                ).strip(),
-                "side": "BUY" if self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "매매구분"
-                ).strip() == "2" else "SELL",
-                "quantity": int(self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "주문수량"
-                ) or 0),
-                "filled_quantity": int(self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "체결량"
-                ) or 0),
-                "price": int(self._ocx.dynamicCall(
-                    "GetCommData(QString, QString, int, QString)", "opt10075", "미체결", i, "주문가격"
-                ) or 0),
-            }
-            if order_data["broker_order_id"]:
-                orders.append(order_data)
-
-        return orders
+        return await self._invoke_in_qt(_read_orders)
 
     async def fetch_balance(self) -> Balance:
         """Fetch account balance from Kiwoom."""
@@ -526,21 +621,26 @@ class KiwoomBroker(BaseBroker):
             },
         )
 
-        total = int(self._ocx.dynamicCall(
-            "GetCommData(QString, QString, int, QString)", "opw00018", "계좌평가결과", 0, "총평가금액"
-        ) or 0)
-        cash = int(self._ocx.dynamicCall(
-            "GetCommData(QString, QString, int, QString)", "opw00018", "계좌평가결과", 0, "추정예탁자산"
-        ) or 0)
-        pnl = int(self._ocx.dynamicCall(
-            "GetCommData(QString, QString, int, QString)", "opw00018", "계좌평가결과", 0, "총평가손익금액"
-        ) or 0)
+        def _read_balance():
+            total = int(self._ocx.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "opw00018", "계좌평가결과", 0, "총평가금액",
+            ) or 0)
+            cash = int(self._ocx.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "opw00018", "계좌평가결과", 0, "추정예탁자산",
+            ) or 0)
+            pnl = int(self._ocx.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "opw00018", "계좌평가결과", 0, "총평가손익금액",
+            ) or 0)
+            return Balance(
+                total_equity=Decimal(total),
+                available_cash=Decimal(cash),
+                unrealized_pnl=Decimal(pnl),
+            )
 
-        return Balance(
-            total_equity=Decimal(total),
-            available_cash=Decimal(cash),
-            unrealized_pnl=Decimal(pnl),
-        )
+        return await self._invoke_in_qt(_read_balance)
 
     async def subscribe_market_data(
         self, symbols: list[str], callback: TickCallback
@@ -551,18 +651,45 @@ class KiwoomBroker(BaseBroker):
                 self._tick_callbacks[symbol] = []
             self._tick_callbacks[symbol].append(callback)
 
-            fids = "10;11;12;15;20"  # price, volume, etc.
-            self._ocx.dynamicCall(
-                "SetRealReg(QString, QString, QString, QString)",
-                "0200", symbol, fids, "1"
+        if not symbols:
+            return
+
+        fids = "10;11;12;15;20"  # price, volume, etc.
+        symbol_list = ";".join(symbols)
+        try:
+            await asyncio.wait_for(
+                self._invoke_in_qt(
+                    lambda: self._ocx.dynamicCall(
+                        "SetRealReg(QString, QString, QString, QString)",
+                        "0200", symbol_list, fids, "1"
+                    )
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SetRealReg timeout for %d symbols - will receive data when market opens",
+                len(symbols),
             )
 
-        logger.info("Subscribed to market data: %s", symbols)
+        logger.info("Subscribed to market data: %d symbols", len(symbols))
 
     async def unsubscribe_market_data(self, symbols: list[str]) -> None:
         """Unsubscribe from real-time market data."""
         for symbol in symbols:
             self._tick_callbacks.pop(symbol, None)
-            self._ocx.dynamicCall("SetRealRemove(QString, QString)", "0200", symbol)
 
-        logger.info("Unsubscribed from market data: %s", symbols)
+        for symbol in symbols:
+            try:
+                await asyncio.wait_for(
+                    self._invoke_in_qt(
+                        lambda s=symbol: self._ocx.dynamicCall(
+                            "SetRealRemove(QString, QString)", "0200", s
+                        )
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("SetRealRemove timeout for %s", symbol)
+
+        logger.info("Unsubscribed from market data: %d symbols", len(symbols))

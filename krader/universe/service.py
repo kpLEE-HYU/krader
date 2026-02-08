@@ -1,9 +1,8 @@
 """Universe service for fetching top traded symbols."""
 
-import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from krader.broker.kiwoom import KiwoomBroker
@@ -86,6 +85,9 @@ class UniverseService:
         """
         Request opt10030 TR (거래량상위 - Top by Volume/Value).
 
+        Uses the broker's TR request infrastructure which properly handles
+        the Qt signal-based OnReceiveTrData callback.
+
         Input fields:
         - 시장구분: 000=전체, 001=코스피, 101=코스닥
         - 정렬구분: 1=거래량, 2=거래대금(trading value)
@@ -101,71 +103,30 @@ class UniverseService:
             logger.warning("Broker not connected, cannot fetch universe")
             return []
 
-        ocx = self._broker._ocx
-        if ocx is None:
+        try:
+            await self._broker.request_tr(
+                tr_code="opt10030",
+                rq_name="거래량상위",
+                inputs={"시장구분": market_code, "정렬구분": "2"},
+                screen_no="0301",
+            )
+        except Exception as e:
+            logger.error("opt10030 request failed: %s", e)
             return []
 
-        await self._broker._rate_limit()
-        event = asyncio.Event()
-        result_data: dict[str, Any] = {}
+        symbols = []
+        fetch_size = min(size + 10, 100)
+        for i in range(fetch_size):
+            code = await self._broker.get_comm_data("opt10030", "거래량상위", i, "종목코드")
+            if code:
+                code = code.strip()
+                if code and len(code) == 6 and code.isdigit():
+                    symbols.append(code)
+            if len(symbols) >= size:
+                break
 
-        original_callback = ocx.OnReceiveTrData
-
-        def on_receive_tr_data(
-            screen_no: str,
-            rq_name: str,
-            tr_code: str,
-            record_name: str,
-            prev_next: str,
-        ) -> None:
-            if rq_name == "거래량상위":
-                result_data["received"] = True
-                result_data["tr_code"] = tr_code
-                event.set()
-            if original_callback:
-                original_callback(screen_no, rq_name, tr_code, record_name, prev_next)
-
-        ocx.OnReceiveTrData = on_receive_tr_data
-
-        try:
-            def send_request() -> int:
-                ocx.SetInputValue("시장구분", market_code)
-                ocx.SetInputValue("정렬구분", "2")
-                return ocx.CommRqData("거래량상위", "opt10030", 0, "0301")
-
-            result = await asyncio.to_thread(send_request)
-
-            if result != 0:
-                logger.error("opt10030 request failed: %d", result)
-                return []
-
-            try:
-                await asyncio.wait_for(event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error("opt10030 request timeout")
-                return []
-
-            symbols = []
-            fetch_size = min(size + 10, 100)
-
-            def get_symbols() -> list[str]:
-                syms = []
-                for i in range(fetch_size):
-                    code = ocx.GetCommData("opt10030", "거래량상위", i, "종목코드")
-                    if code:
-                        code = code.strip()
-                        if code and len(code) == 6 and code.isdigit():
-                            syms.append(code)
-                    if len(syms) >= size:
-                        break
-                return syms
-
-            symbols = await asyncio.to_thread(get_symbols)
-            logger.debug("Fetched %d symbols from opt10030", len(symbols))
-            return symbols
-
-        finally:
-            ocx.OnReceiveTrData = original_callback
+        logger.debug("Fetched %d symbols from opt10030", len(symbols))
+        return symbols
 
     async def get_top_by_volume(
         self,
@@ -203,60 +164,28 @@ class UniverseService:
         if not self._broker.is_connected:
             return []
 
-        ocx = self._broker._ocx
-        if ocx is None:
+        try:
+            await self._broker.request_tr(
+                tr_code="opt10030",
+                rq_name="거래량상위_볼륨",
+                inputs={"시장구분": market_code, "정렬구분": "1"},
+                screen_no="0302",
+            )
+        except Exception as e:
+            logger.error("opt10030 volume request failed: %s", e)
             return []
 
-        await self._broker._rate_limit()
-        event = asyncio.Event()
+        symbols = []
+        for i in range(size + 10):
+            code = await self._broker.get_comm_data("opt10030", "거래량상위", i, "종목코드")
+            if code:
+                code = code.strip()
+                if code and len(code) == 6 and code.isdigit():
+                    symbols.append(code)
+            if len(symbols) >= size:
+                break
 
-        original_callback = ocx.OnReceiveTrData
-
-        def on_receive_tr_data(
-            screen_no: str,
-            rq_name: str,
-            tr_code: str,
-            record_name: str,
-            prev_next: str,
-        ) -> None:
-            if rq_name == "거래량상위_볼륨":
-                event.set()
-            if original_callback:
-                original_callback(screen_no, rq_name, tr_code, record_name, prev_next)
-
-        ocx.OnReceiveTrData = on_receive_tr_data
-
-        try:
-            def send_request() -> int:
-                ocx.SetInputValue("시장구분", market_code)
-                ocx.SetInputValue("정렬구분", "1")
-                return ocx.CommRqData("거래량상위_볼륨", "opt10030", 0, "0302")
-
-            result = await asyncio.to_thread(send_request)
-            if result != 0:
-                return []
-
-            try:
-                await asyncio.wait_for(event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                return []
-
-            def get_symbols() -> list[str]:
-                syms = []
-                for i in range(size + 10):
-                    code = ocx.GetCommData("opt10030", "거래량상위", i, "종목코드")
-                    if code:
-                        code = code.strip()
-                        if code and len(code) == 6 and code.isdigit():
-                            syms.append(code)
-                    if len(syms) >= size:
-                        break
-                return syms
-
-            return await asyncio.to_thread(get_symbols)
-
-        finally:
-            ocx.OnReceiveTrData = original_callback
+        return symbols
 
     def set_static_universe(self, symbols: list[str]) -> None:
         """
