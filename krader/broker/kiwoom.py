@@ -611,33 +611,33 @@ class KiwoomBroker(BaseBroker):
         """Fetch account balance from Kiwoom."""
         password = "0000" if self._is_paper else ""
         await self._request_tr(
-            "opw00018",
-            "계좌평가",
+            "opw00001",
+            "예수금상세현황",
             {
                 "계좌번호": self._account_number,
                 "비밀번호": password,
                 "비밀번호입력매체구분": "00",
                 "조회구분": "1",
             },
+            screen_no="0102",
         )
 
         def _read_balance():
-            total = int(self._ocx.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                "opw00018", "계좌평가결과", 0, "총평가금액",
-            ) or 0)
             cash = int(self._ocx.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                "opw00018", "계좌평가결과", 0, "추정예탁자산",
-            ) or 0)
-            pnl = int(self._ocx.dynamicCall(
+                "opw00001", "예수금상세현황", 0, "주문가능금액",
+            ).strip() or 0)
+            total = int(self._ocx.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                "opw00018", "계좌평가결과", 0, "총평가손익금액",
-            ) or 0)
+                "opw00001", "예수금상세현황", 0, "추정예탁자산",
+            ).strip() or 0)
+            deposit = int(self._ocx.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                "opw00001", "예수금상세현황", 0, "예수금",
+            ).strip() or 0)
             return Balance(
-                total_equity=Decimal(total),
+                total_equity=Decimal(total) if total else Decimal(deposit),
                 available_cash=Decimal(cash),
-                unrealized_pnl=Decimal(pnl),
             )
 
         return await self._invoke_in_qt(_read_balance)
