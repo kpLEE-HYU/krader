@@ -28,7 +28,6 @@ class Balance:
     total_equity: Decimal
     available_cash: Decimal
     margin_used: Decimal = field(default_factory=lambda: Decimal("0"))
-    unrealized_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
 
 
 TickCallback = Callable[["Tick"], Coroutine[Any, Any, None]]
