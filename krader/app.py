@@ -2,13 +2,14 @@
 
 import asyncio
 import logging
+import random
 import signal
 import time
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from krader.broker.base import BaseBroker
+from krader.broker.base import BaseBroker, TickCallback
 from krader.broker.kiwoom import KiwoomBroker
 from krader.config import Settings
 from krader.journal.service import JournalService
@@ -16,6 +17,7 @@ from krader.events import ControlEvent, ErrorEvent, EventBus, FillEvent, MarketE
 from krader.notification import EmailNotifier
 from krader.execution.oms import OrderManagementSystem
 from krader.market.service import MarketDataService
+from krader.market.types import Tick
 from krader.monitor.control import ControlManager
 from krader.monitor.logger import get_trade_logger, setup_logging
 from krader.persistence.database import Database
@@ -33,13 +35,59 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 trade_logger = get_trade_logger()
 
+# Seed prices for KOSPI blue chips (matches KOSPI_BLUE_CHIPS order in universe/service.py)
+_SEED_PRICES: dict[str, int] = {
+    "005930": 72000,   # Samsung Electronics
+    "000660": 130000,  # SK Hynix
+    "373220": 450000,  # LG Energy Solution
+    "207940": 750000,  # Samsung Biologics
+    "005380": 210000,  # Hyundai Motor
+    "006400": 380000,  # Samsung SDI
+    "051910": 460000,  # LG Chem
+    "035420": 210000,  # NAVER
+    "000270": 95000,   # Kia
+    "105560": 65000,   # KB Financial
+    "055550": 42000,   # Shinhan Financial
+    "035720": 45000,   # Kakao
+    "003670": 320000,  # POSCO Holdings
+    "068270": 180000,  # Celltrion
+    "028260": 130000,  # Samsung C&T
+    "012330": 240000,  # Hyundai Mobis
+    "066570": 100000,  # LG Electronics
+    "003550": 80000,   # LG
+    "096770": 110000,  # SK Innovation
+    "034730": 170000,  # SK
+}
+
+
+def _round_to_tick_size(price: int) -> int:
+    """Round price to KRX tick size."""
+    if price < 2000:
+        step = 1
+    elif price < 5000:
+        step = 5
+    elif price < 20000:
+        step = 10
+    elif price < 50000:
+        step = 50
+    elif price < 200000:
+        step = 100
+    elif price < 500000:
+        step = 500
+    else:
+        step = 1000
+    return max(step, round(price / step) * step)
+
 
 class MockBroker(BaseBroker):
-    """Mock broker for testing."""
+    """Mock broker for testing with synthetic tick generation."""
 
     def __init__(self) -> None:
         self._connected = False
         self._order_counter = 0
+        self._tick_callbacks: dict[str, TickCallback] = {}
+        self._symbol_prices: dict[str, float] = {}
+        self._tick_task: asyncio.Task | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -51,6 +99,13 @@ class MockBroker(BaseBroker):
 
     async def disconnect(self) -> None:
         self._connected = False
+        if self._tick_task and not self._tick_task.done():
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
         logger.info("Mock broker disconnected")
 
     async def place_order(self, order) -> str:
@@ -77,10 +132,64 @@ class MockBroker(BaseBroker):
         )
 
     async def subscribe_market_data(self, symbols, callback) -> None:
-        pass
+        for symbol in symbols:
+            self._tick_callbacks[symbol] = callback
+            if symbol not in self._symbol_prices:
+                self._symbol_prices[symbol] = float(
+                    _SEED_PRICES.get(symbol, 50000)
+                )
+
+        if self._tick_task is None or self._tick_task.done():
+            self._tick_task = asyncio.create_task(self._generate_ticks())
+            logger.info("Mock tick generator started (%d symbols)", len(self._tick_callbacks))
 
     async def unsubscribe_market_data(self, symbols) -> None:
-        pass
+        for symbol in symbols:
+            self._tick_callbacks.pop(symbol, None)
+            self._symbol_prices.pop(symbol, None)
+
+        if not self._tick_callbacks and self._tick_task and not self._tick_task.done():
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
+            logger.info("Mock tick generator stopped (no subscriptions)")
+
+    async def _generate_ticks(self) -> None:
+        """Background task: generate synthetic ticks every 0.5s."""
+        logger.info("Mock tick generation loop started")
+        try:
+            while self._tick_callbacks:
+                for symbol, callback in list(self._tick_callbacks.items()):
+                    price = self._symbol_prices.get(symbol)
+                    if price is None:
+                        continue
+
+                    # Random walk: ~0.03% per tick ≈ annualised ~20% vol
+                    change = random.gauss(0, 0.0003)
+                    price *= (1 + change)
+                    price = max(price, 1)
+                    int_price = _round_to_tick_size(int(round(price)))
+                    self._symbol_prices[symbol] = float(int_price)
+
+                    volume = random.randint(1, 500)
+
+                    tick = Tick(
+                        symbol=symbol,
+                        price=Decimal(int_price),
+                        volume=volume,
+                    )
+                    try:
+                        await callback(tick)
+                    except Exception:
+                        logger.exception("Mock tick callback error for %s", symbol)
+
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            logger.info("Mock tick generation loop cancelled")
+            raise
 
 
 class Application:
